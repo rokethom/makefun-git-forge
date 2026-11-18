@@ -225,7 +225,15 @@ export function uploadPack(store: Store, repo: Repo, body: Buffer): Buffer {
     }
     args.push(line);
   }
-  if (command === 'ls-refs') return lsRefs(repo, args);
+  if (command === 'ls-refs') {
+    const key = `ls:${repo.id}:${repo.version}:${args.join(',')}`;
+    const hit = store.packs.get(key);
+    if (hit !== undefined) return hit;
+    const answer = lsRefs(repo, args);
+    if (store.packs.size > 64) store.packs.clear();
+    store.packs.set(key, answer);
+    return answer;
+  }
   if (command !== 'fetch') return Buffer.concat([pkt('ERR unknown command\n'), FLUSH]);
 
   const wants = args.filter((arg) => arg.startsWith('want ')).map((arg) => arg.slice(5).trim());
@@ -256,23 +264,23 @@ export function uploadPack(store: Store, repo: Repo, body: Buffer): Buffer {
     parts.push(DELIM);
   }
 
-  // The clone workload asks for the same shallow pack fifty times over: build it once.
+  // The clone workload asks for the same shallow fetch fifty times over: build the whole answer once.
   const cacheKey = `${repo.id}:${repo.version}:${depth ?? 'full'}:${wants.join(',')}:${haves.join(',')}`;
-  let pack = store.packs.get(cacheKey);
-  if (pack === undefined) {
-    const objects = depth !== null && Number.isFinite(depth) && depth > 0 ? objectsOfCommits(repo, new Set(tips)) : reachable(repo, tips, haveSet);
-    const list = [...objects.entries()].filter(([sha]) => !haveSet.has(sha)).map(([, object]) => object);
-    pack = writePack(list);
-    if (store.packs.size > 64) store.packs.clear();
-    store.packs.set(cacheKey, pack);
-  }
+  const cached = store.packs.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const objects = depth !== null && Number.isFinite(depth) && depth > 0 ? objectsOfCommits(repo, new Set(tips)) : reachable(repo, tips, haveSet);
+  const list = [...objects.entries()].filter(([sha]) => !haveSet.has(sha)).map(([, object]) => object);
+  const pack = writePack(list);
   parts.push(pkt('packfile\n'));
   for (let offset = 0; offset < pack.length; offset += 65515) {
     const chunk = pack.subarray(offset, Math.min(offset + 65515, pack.length));
     parts.push(pkt(Buffer.concat([Buffer.from([1]), chunk])));
   }
   parts.push(FLUSH);
-  return Buffer.concat(parts);
+  const answer = Buffer.concat(parts);
+  if (store.packs.size > 64) store.packs.clear();
+  store.packs.set(cacheKey, answer);
+  return answer;
 }
 
 /** Answer a v0 receive-pack request: apply the commands, then report each one. */
