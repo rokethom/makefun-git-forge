@@ -8,6 +8,10 @@ export interface Reply {
   status: number;
   body: unknown;
   headers?: Record<string, string>;
+  /** A body already rendered to JSON, so a hot read path need not stringify it again. */
+  raw?: string;
+  /** The byte length of `raw`, computed when it was rendered. */
+  rawBytes?: number;
 }
 
 const JSON_TYPE = 'application/json; charset=utf-8';
@@ -222,6 +226,7 @@ export function mergePull(store: Store, repo: Repo, pull: Pull): string | null {
   const data = buildCommit(headInfo.tree, [baseSha], identity, identity, `${pull.title} (#${pull.number})`);
   const mergeSha = store.put(repo, 'commit', data);
   repo.refs.set(`refs/heads/${pull.base}`, mergeSha);
+  repo.version += 1;
   pull.merged = true;
   pull.state = 'closed';
   pull.mergedAt = store.clock.now();
@@ -403,18 +408,39 @@ export interface RestRequest {
   origin: string;
 }
 
+/** The issue a path segment names, compared as a number rather than as text. */
+function issueOf(repo: Repo, segment: string): Issue | undefined {
+  const number = Number(segment);
+  if (!Number.isInteger(number)) return undefined;
+  return repo.issues.find((candidate) => candidate.number === number);
+}
+
+/** The pull request a path segment names, compared as a number rather than as text. */
+function pullOf(repo: Repo, segment: string): Pull | undefined {
+  const number = Number(segment);
+  if (!Number.isInteger(number)) return undefined;
+  return repo.pulls.find((candidate) => candidate.number === number);
+}
+
 /** The repository a path names, or undefined when it is not the viewer's. */
 function repoOf(store: Store, owner: string, name: string): Repo | undefined {
   const repo = store.find(owner, name);
   if (repo === undefined) return undefined;
-  if (repo.owner.toLowerCase() !== store.viewer.login) return undefined;
+  if (repo.owner !== store.viewer.login) return undefined;
   return repo;
 }
 
 /** Answer one REST v3 request, or null when the path is not a REST route. */
 export function handleRest(request: RestRequest): Reply | null {
   const { method, path, query, body, store, origin } = request;
-  const segments = path.split('/').filter((segment) => segment !== '');
+  const segments: string[] = [];
+  let start = 1;
+  for (let i = 1; i <= path.length; i += 1) {
+    if (i === path.length || path.charCodeAt(i) === 47) {
+      if (i > start) segments.push(path.slice(start, i));
+      start = i + 1;
+    }
+  }
   if (segments[0] !== 'api' || segments[1] !== 'v3') return null;
   const rest = segments.slice(2);
   const asObject = (value: unknown): Record<string, unknown> => (typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {});
@@ -513,18 +539,22 @@ export function handleRest(request: RestRequest): Reply | null {
     const full = `${repo.owner}/${repo.name}`;
 
     if (tail.length === 0) {
-      if (method === 'GET') return { status: 200, body: repoJson(repo) };
+      if (method === 'GET') {
+        const rendered = store.render(`${repo.id}:${repo.version}:repo`, () => JSON.stringify(repoJson(repo)));
+        return { status: 200, body: null, raw: rendered.text, rawBytes: rendered.bytes };
+      }
       if (method === 'PATCH') {
         const input = asObject(body);
         if (typeof input.description === 'string') repo.description = input.description;
         if (typeof input.name === 'string' && input.name !== '') {
           store.deleteRepo(repo);
           repo.name = input.name;
-          store.repos.set(`${repo.owner.toLowerCase()}/${repo.name.toLowerCase()}`, repo);
+          store.reindex(repo);
         }
         if (typeof input.private === 'boolean') repo.private = input.private;
         if (typeof input.default_branch === 'string' && input.default_branch !== '') repo.defaultBranch = input.default_branch;
         repo.updatedAt = store.clock.now();
+        repo.version += 1;
         return { status: 200, body: repoJson(repo) };
       }
       if (method === 'DELETE') {
@@ -572,6 +602,7 @@ export function handleRest(request: RestRequest): Reply | null {
         if (ref === '' || sha === '') return unprocessable('Reference update failed');
         if (!repo.objects.has(sha)) return unprocessable('Object does not exist');
         repo.refs.set(ref, sha);
+        repo.version += 1;
         return { status: 201, body: { ref, node_id: `REF_${ref}`, url: `/api/v3/repos/${full}/git/refs/${ref.replace('refs/', '')}`, object: { sha, type: 'commit', url: `/api/v3/repos/${full}/git/commits/${sha}` } } };
       }
       if (method === 'GET') {
@@ -585,6 +616,7 @@ export function handleRest(request: RestRequest): Reply | null {
       const sha = asString(input.sha);
       if (!repo.objects.has(sha)) return unprocessable('Object does not exist');
       repo.refs.set(ref, sha);
+      repo.version += 1;
       return { status: 200, body: { ref, object: { sha, type: 'commit' } } };
     }
 
@@ -656,7 +688,10 @@ export function handleRest(request: RestRequest): Reply | null {
         const input = asObject(body);
         const name = asString(input.name);
         if (name === '') return unprocessable('Validation Failed');
-        if (!repo.labels.includes(name)) repo.labels.push(name);
+        if (!repo.labels.includes(name)) {
+          repo.labels.push(name);
+          repo.version += 1;
+        }
         return { status: 201, body: labelJson(name, repo.labels.indexOf(name)) };
       }
       if (method === 'GET') return { status: 200, body: repo.labels.map((name, index) => labelJson(name, index)) };
@@ -689,9 +724,12 @@ export function handleRest(request: RestRequest): Reply | null {
         return { status: 200, body: list.slice(0, perPage).map((issue) => issueJson(repo, issue)) };
       }
       if (tail.length === 2) {
-        const issue = repo.issues.find((candidate) => String(candidate.number) === tail[1]);
+        const issue = issueOf(repo, tail[1]);
         if (issue === undefined) return notFound();
-        if (method === 'GET') return { status: 200, body: issueJson(repo, issue) };
+        if (method === 'GET') {
+          const rendered = store.render(`${repo.id}:${repo.version}:issue:${issue.number}`, () => JSON.stringify(issueJson(repo, issue)));
+          return { status: 200, body: null, raw: rendered.text, rawBytes: rendered.bytes };
+        }
         if (method === 'PATCH') {
           const input = asObject(body);
           if (typeof input.title === 'string') issue.title = input.title;
@@ -709,11 +747,12 @@ export function handleRest(request: RestRequest): Reply | null {
             issue.labels = labels;
           }
           issue.updatedAt = store.clock.now();
+          repo.version += 1;
           return { status: 200, body: issueJson(repo, issue) };
         }
       }
       if (tail.length === 3 && tail[2] === 'comments') {
-        const issue = repo.issues.find((candidate) => String(candidate.number) === tail[1]);
+        const issue = issueOf(repo, tail[1]);
         if (issue === undefined) return notFound();
         if (method === 'POST') {
           const input = asObject(body);
@@ -744,7 +783,7 @@ export function handleRest(request: RestRequest): Reply | null {
         return { status: 200, body: list.map((pull) => pullJson(store, repo, pull)) };
       }
       if (tail.length === 2) {
-        const pull = repo.pulls.find((candidate) => String(candidate.number) === tail[1]);
+        const pull = pullOf(repo, tail[1]);
         if (pull === undefined) return notFound();
         if (method === 'GET') return { status: 200, body: pullJson(store, repo, pull) };
         if (method === 'PATCH') {
@@ -755,16 +794,17 @@ export function handleRest(request: RestRequest): Reply | null {
             pull.state = 'closed';
             pull.updatedAt = store.clock.now();
           }
+          repo.version += 1;
           return { status: 200, body: pullJson(store, repo, pull) };
         }
       }
       if (tail.length === 3 && tail[2] === 'files' && method === 'GET') {
-        const pull = repo.pulls.find((candidate) => String(candidate.number) === tail[1]);
+        const pull = pullOf(repo, tail[1]);
         if (pull === undefined) return notFound();
         return { status: 200, body: pullFiles(store, repo, pull) };
       }
       if (tail.length === 3 && tail[2] === 'merge' && method === 'PUT') {
-        const pull = repo.pulls.find((candidate) => String(candidate.number) === tail[1]);
+        const pull = pullOf(repo, tail[1]);
         if (pull === undefined) return notFound();
         const merged = mergePull(store, repo, pull);
         if (merged === null) return { status: 405, body: { message: 'Pull Request is not mergeable' } };

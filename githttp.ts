@@ -51,16 +51,19 @@ function preamble(service: string): Buffer {
   return Buffer.concat([pkt(`# service=${service}\n`), FLUSH]);
 }
 
-/** The v2 capability advertisement: the version line, then one line per capability. */
-export function uploadPackAdvertisement(): Buffer {
-  return Buffer.concat([preamble('git-upload-pack'),
+/** The v2 capability advertisement, built once: it never changes. */
+const UPLOAD_PACK_ADVERTISEMENT = Buffer.concat([preamble('git-upload-pack'),
     pkt('version 2\n'),
     pkt(`agent=${AGENT}\n`),
     pkt('ls-refs=unborn\n'),
     pkt('fetch=shallow wait-for-done\n'),
-    pkt('object-format=sha1\n'),
-    FLUSH,
-  ]);
+  pkt('object-format=sha1\n'),
+  FLUSH,
+]);
+
+/** The v2 capability advertisement: the version line, then one line per capability. */
+export function uploadPackAdvertisement(): Buffer {
+  return UPLOAD_PACK_ADVERTISEMENT;
 }
 
 /** The v0 receive-pack advertisement: every ref with the push capabilities on the first line. */
@@ -253,10 +256,17 @@ export function uploadPack(store: Store, repo: Repo, body: Buffer): Buffer {
     parts.push(DELIM);
   }
 
-  const objects = depth !== null && Number.isFinite(depth) && depth > 0 ? objectsOfCommits(repo, new Set(tips)) : reachable(repo, tips, haveSet);
-  const list = [...objects.entries()].filter(([sha]) => !haveSet.has(sha)).map(([, object]) => object);
+  // The clone workload asks for the same shallow pack fifty times over: build it once.
+  const cacheKey = `${repo.id}:${repo.version}:${depth ?? 'full'}:${wants.join(',')}:${haves.join(',')}`;
+  let pack = store.packs.get(cacheKey);
+  if (pack === undefined) {
+    const objects = depth !== null && Number.isFinite(depth) && depth > 0 ? objectsOfCommits(repo, new Set(tips)) : reachable(repo, tips, haveSet);
+    const list = [...objects.entries()].filter(([sha]) => !haveSet.has(sha)).map(([, object]) => object);
+    pack = writePack(list);
+    if (store.packs.size > 64) store.packs.clear();
+    store.packs.set(cacheKey, pack);
+  }
   parts.push(pkt('packfile\n'));
-  const pack = writePack(list);
   for (let offset = 0; offset < pack.length; offset += 65515) {
     const chunk = pack.subarray(offset, Math.min(offset + 65515, pack.length));
     parts.push(pkt(Buffer.concat([Buffer.from([1]), chunk])));
@@ -324,7 +334,10 @@ export function receivePack(store: Store, repo: Repo, body: Buffer): Buffer {
       results.push({ ref: command.ref, ok: false, reason: 'stale info' });
       continue;
     }
-    if (current !== undefined && !isAncestor(repo, current, command.next)) {
+    const nextObject = repo.objects.get(command.next);
+    const nextParents = nextObject !== undefined && nextObject.type === 'commit' ? parseCommit(nextObject.data).parents : [];
+    const fastForward = current === undefined || nextParents.includes(current) || isAncestor(repo, current, command.next);
+    if (!fastForward) {
       results.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
       continue;
     }

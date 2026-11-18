@@ -8,6 +8,12 @@ import { buildCommit, buildTree, hashObject, parseCommit, parseTree, type GitObj
 /** The login the trial's token names: the seeded scenario's viewer, the same in every trial. */
 export const VIEWER_LOGIN = 'adaiversen';
 
+/** A body already rendered to JSON, with the byte length the reply header needs. */
+export interface Rendered {
+  text: string;
+  bytes: number;
+}
+
 export interface User {
   id: number;
   login: string;
@@ -70,6 +76,8 @@ export interface Repo {
   nextIssue: number;
   nextPull: number;
   nextComment: number;
+  /** Bumped on every mutation, so a cached rendering of this repository can be told stale. */
+  version: number;
 }
 
 /** A deterministic clock: a fixed epoch advanced one second per event. */
@@ -88,10 +96,31 @@ export class Store {
   readonly clock = new Clock();
   readonly viewer: User = { id: 1000, login: VIEWER_LOGIN, name: 'ada iversen', email: 'adaiversen@example.invalid' };
   readonly repos = new Map<string, Repo>();
+  /** The same repositories, indexed by lowercased owner and then name, for the hot lookup path. */
+  private readonly index = new Map<string, Map<string, Repo>>();
+  /** Rendered JSON bodies, keyed by the repository version they were built from. */
+  private readonly rendered = new Map<string, Rendered>();
+  /** Packfiles already built for a fetch, keyed by the repository version and the request. */
+  readonly packs = new Map<string, Buffer>();
   private nextRepoId = 5000;
   private nextIssueId = 90000;
   private nextPullId = 80000;
   private nextCommentId = 70000;
+
+  /**
+   * The JSON text for `key`, built once per repository version. The read workload asks for the same
+   * issue two thousand times, so rendering it once and answering the rest from here is most of that
+   * workload's cost.
+   */
+  render(key: string, build: () => string): Rendered {
+    const hit = this.rendered.get(key);
+    if (hit !== undefined) return hit;
+    const text = build();
+    const value: Rendered = { text, bytes: Buffer.byteLength(text) };
+    if (this.rendered.size > 20_000) this.rendered.clear();
+    this.rendered.set(key, value);
+    return value;
+  }
 
   /** The key a repository is stored under: its owner and name, compared without regard to case. */
   static key(owner: string, name: string): string {
@@ -99,7 +128,31 @@ export class Store {
   }
 
   find(owner: string, name: string): Repo | undefined {
-    return this.repos.get(Store.key(owner, name));
+    const byName = this.index.get(owner.toLowerCase());
+    return byName === undefined ? undefined : byName.get(name.toLowerCase());
+  }
+
+  /** Put a repository in both the flat map and the lookup index. */
+  private index_(repo: Repo): void {
+    this.repos.set(Store.key(repo.owner, repo.name), repo);
+    const key = repo.owner.toLowerCase();
+    let byName = this.index.get(key);
+    if (byName === undefined) {
+      byName = new Map<string, Repo>();
+      this.index.set(key, byName);
+    }
+    byName.set(repo.name.toLowerCase(), repo);
+  }
+
+  /** Put a repository back in the index after its name changed. */
+  reindex(repo: Repo): void {
+    this.index_(repo);
+  }
+
+  /** Take a repository out of both the flat map and the lookup index. */
+  private unindex(repo: Repo): void {
+    this.repos.delete(Store.key(repo.owner, repo.name));
+    this.index.get(repo.owner.toLowerCase())?.delete(repo.name.toLowerCase());
   }
 
   /** The repositories the viewer owns, in creation order. */
@@ -127,13 +180,14 @@ export class Store {
       nextIssue: 1,
       nextPull: 1,
       nextComment: 1,
+      version: 0,
     };
-    this.repos.set(Store.key(repo.owner, repo.name), repo);
+    this.index_(repo);
     return repo;
   }
 
   deleteRepo(repo: Repo): void {
-    this.repos.delete(Store.key(repo.owner, repo.name));
+    this.unindex(repo);
   }
 
   /** Store an object and answer its id. */
@@ -277,6 +331,7 @@ export class Store {
     const data = buildCommit(treeSha, parent === undefined ? [] : [parent], identity, identity, message);
     const sha = this.put(repo, 'commit', data);
     repo.refs.set(ref, sha);
+    repo.version += 1;
     repo.pushedAt = this.clock.now();
     repo.updatedAt = repo.pushedAt;
     return sha;
@@ -323,6 +378,7 @@ export class Store {
       comments: [],
     };
     repo.issues.push(issue);
+    repo.version += 1;
     return issue;
   }
 
@@ -344,12 +400,14 @@ export class Store {
       mergeCommitSha: null,
     };
     repo.pulls.push(pull);
+    repo.version += 1;
     return pull;
   }
 
   addComment(repo: Repo, issue: Issue, body: string): Comment {
     const comment: Comment = { id: this.nextCommentId++, body, user: this.viewer, createdAt: this.clock.now() };
     issue.comments.push(comment);
+    repo.version += 1;
     return comment;
   }
 }
